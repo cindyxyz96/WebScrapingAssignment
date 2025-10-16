@@ -1,0 +1,16 @@
+
+selenium
+pandas
+numpy
+openpyxl
+nltk
+matplotlib
+seaborn
+xlsxwriter
+wordcloud
+plotly
+dash
+beautifulsoup4
+lxml
+tenacity
+pytest
