@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import json
-import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver import Chrome
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -18,13 +21,12 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
-# tqdm (soft dependency)
+# tqdm (fallback graceful)
 try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
-    def tqdm(iterable: Iterable = None, *_, **__):
+    def tqdm(iterable: Optional[Iterable] = None, *_, **__):
         return iterable if iterable is not None else []
 
 from config import SETTINGS
@@ -37,52 +39,49 @@ from utils import (
 
 logger = setup_logger(SETTINGS.logs_dir, "scraper")
 
-# ---------- Constants ----------
+# PDP link patterns we consider valid
 PRODUCT_HREF_RE = re.compile(
-    r"(/product/[^/]+/[A-Z0-9]{6,}(\b|/)|/site/.+?/.*?/p\?skuId=\d+)",
+    r"(/product/[^/]+/[A-Z0-9]{6,}"
+    r"|/site/.+?/.*?/p\?skuId=\d+"
+    r"|/site/[-a-z0-9]+/\d+\.p)",  # some “/site/<slug>/<sku>.p” variants
     re.IGNORECASE,
 )
 
 CATEGORY_URL = (
-    "https://www.bestbuy.com/site/laptop-computers/all-laptops/"
-    "pcmcat138500050001.c?id=pcmcat138500050001"
+    "https://www.bestbuy.com/site/laptop-computers/all-laptops/pcmcat138500050001.c"
+    "?id=pcmcat138500050001"
 )
 
-LAPTOP_KEYWORDS = ("laptop", "notebook", "macbook", "chromebook", "2-in-1")
 
-EXCLUDED_SECTION_TITLES = (
-    "popular laptops",
-    "you recently viewed",
-    "explore related products",
-    "customers also viewed",
-    "featured",
-)
-
-# ---------- Driver ----------
+# =========================
+# Driver setup (fast & light)
+# =========================
 def _build_driver() -> Chrome:
     opts = Options()
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-
-    # Fast desktop UA
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
     )
     opts.add_argument("--window-size=1920,1080")
-    if getattr(SETTINGS, "headless", True):
+    if SETTINGS.headless:
         opts.add_argument("--headless=new")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
-
-    # Lighter pages: block heavy resources
-    opts.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.managed_default_content_settings.plugins": 2,
-        "profile.managed_default_content_settings.popups": 2,
-    })
+    # Make load snappier
     opts.set_capability("pageLoadStrategy", "eager")
+
+    # Block heavy assets for speed (do NOT block .svg as some UIs rely on it)
+    opts.add_experimental_option(
+        "prefs",
+        {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.managed_default_content_settings.plugins": 2,
+            "profile.managed_default_content_settings.popups": 2,
+        },
+    )
 
     if getattr(SETTINGS, "chrome_binary", None):
         opts.binary_location = SETTINGS.chrome_binary
@@ -95,23 +94,36 @@ def _build_driver() -> Chrome:
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
     )
 
-    # Block heavy network
+    # Block heavy network at protocol level too
     try:
         driver.execute_cdp_cmd("Network.enable", {})
         driver.execute_cdp_cmd("Network.setBypassServiceWorker", {"bypass": True})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": [
-                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
-                "*.woff", "*.woff2", "*.ttf", "*.otf",
-                "*.mp4", "*.webm", "*.mov", "*.avi",
-            ]
-        })
+        driver.execute_cdp_cmd(
+            "Network.setBlockedURLs",
+            {
+                "urls": [
+                    "*.png",
+                    "*.jpg",
+                    "*.jpeg",
+                    "*.gif",
+                    "*.webp",
+                    # keep "*.svg" allowed
+                    "*.woff",
+                    "*.woff2",
+                    "*.ttf",
+                    "*.otf",
+                    "*.mp4",
+                    "*.webm",
+                    "*.mov",
+                    "*.avi",
+                ]
+            },
+        )
     except Exception:
         pass
 
     driver.implicitly_wait(getattr(SETTINGS, "implicit_wait", 5))
     driver.set_page_load_timeout(getattr(SETTINGS, "page_load_timeout", 60))
-    driver.set_script_timeout(getattr(SETTINGS, "script_timeout", 30))
     return driver
 
 
@@ -126,13 +138,15 @@ def _add_nosplash(url: str) -> str:
 PLP_URLS = [
     _add_nosplash(CATEGORY_URL),
     _add_nosplash(
-        "https://www.bestbuy.com/site/searchpage.jsp?"
-        "browsedCategory=pcmcat138500050001&id=pcat17071&"
-        "st=categoryid$pcmcat138500050001"
+        "https://www.bestbuy.com/site/searchpage.jsp?browsedCategory=pcmcat138500050001"
+        "&id=pcat17071&st=categoryid$pcmcat138500050001"
     ),
 ]
 
-# ---------- Page helpers ----------
+
+# =========================
+# Splash / navigation helpers
+# =========================
 def _is_country_splash(driver: Chrome) -> bool:
     try:
         return bool(driver.find_elements(By.CSS_SELECTOR, ".country-selection .us-link"))
@@ -148,8 +162,9 @@ def handle_country_splash(driver: Chrome) -> None:
         us = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, ".country-selection .us-link"))
         )
-        driver.add_cookie({"name": "intl_splash", "value": "false",
-                           "domain": ".bestbuy.com", "path": "/"})
+        driver.add_cookie(
+            {"name": "intl_splash", "value": "false", "domain": ".bestbuy.com", "path": "/"}
+        )
         driver.execute_script("arguments[0].click();", us)
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "body"))
@@ -173,7 +188,7 @@ def _assert_laptop_plp_loaded(driver: Chrome, timeout: int = 30) -> None:
         ]:
             if driver.find_elements(By.CSS_SELECTOR, sel):
                 return
-        time.sleep(0.3)
+        time.sleep(0.5)
     raise TimeoutException("PLP not ready (no sidebar or product grid found).")
 
 
@@ -181,18 +196,22 @@ def _wait_for_grid_refresh(driver: Chrome, prev_count: int | None = None, timeou
     end = time.time() + timeout
     last_seen = -1
     while time.time() < end:
-        cards = _find_plp_cards(driver)
+        cards = driver.find_elements(
+            By.CSS_SELECTOR,
+            "[data-testid='sku-item'], li.product-list-item.product-list-item-gridView, "
+            "article[data-sku-id]",
+        )
         count = len(cards)
         if count > 0 and (prev_count is None or count != prev_count):
             return count
-        time.sleep(0.4)
+        time.sleep(0.5)
         last_seen = count
     return last_seen
 
 
 def seed_location(driver: Chrome, zip_code: str = "96939", store_id: str = "852") -> None:
     driver.get("https://www.bestbuy.com/")
-    time.sleep(0.8)
+    time.sleep(1.0)
     for ck in [
         {"name": "locDestZip", "value": zip_code, "domain": ".bestbuy.com", "path": "/"},
         {"name": "locStoreId", "value": store_id, "domain": ".bestbuy.com", "path": "/"},
@@ -204,11 +223,13 @@ def seed_location(driver: Chrome, zip_code: str = "96939", store_id: str = "852"
 
 
 def _wait(driver: Chrome, by, locator, timeout: int | None = None):
-    timeout = timeout or getattr(SETTINGS, "explicit_wait", 15)
-    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, locator)))
+    timeout = timeout or getattr(SETTINGS, "explicit_wait", 12)
+    return WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((by, locator))
+    )
 
 
-def _try_click_any(driver: Chrome, selectors: list[str], wait_after=0.2) -> bool:
+def _try_click_any(driver: Chrome, selectors: list[str], wait_after=0.4) -> bool:
     for sel in selectors:
         try:
             el = WebDriverWait(driver, 3).until(
@@ -251,25 +272,35 @@ def _dismiss_backdrops(driver: Chrome, attempts: int = 4) -> None:
                 try:
                     blocked = True
                     driver.execute_script("arguments[0].click();", el)
-                    time.sleep(0.05)
+                    time.sleep(0.08)
                 except Exception:
                     pass
         if blocked:
             try:
                 ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                time.sleep(0.08)
+            except Exception:
+                pass
+        # Hard remove stubborn overlay
+        for el in driver.find_elements(By.CSS_SELECTOR, "[data-testid='sheet-id-backdrop']"):
+            try:
+                driver.execute_script(
+                    "el=arguments[0]; el.parentNode && el.parentNode.removeChild(el);", el
+                )
                 time.sleep(0.05)
             except Exception:
                 pass
-        for el in driver.find_elements(By.CSS_SELECTOR, "[data-testid='sheet-id-backdrop']"):
-            try:
-                driver.execute_script("el=arguments[0]; el.remove && el.remove();", el)
-            except Exception:
-                pass
+        try:
+            driver.execute_script(
+                "document.body.style.overflow='auto'; document.documentElement.style.overflow='auto';"
+            )
+        except Exception:
+            pass
         if not driver.find_elements(By.CSS_SELECTOR, "[data-testid='sheet-id-backdrop']"):
             break
 
 
-def smart_scroll(driver: Chrome, passes=6, pause=0.35) -> None:
+def smart_scroll(driver: Chrome, passes=6, pause=0.5) -> None:
     body = driver.find_element(By.TAG_NAME, "body")
     for _ in range(passes):
         body.send_keys(Keys.END)
@@ -279,14 +310,17 @@ def smart_scroll(driver: Chrome, passes=6, pause=0.35) -> None:
 def navigate_to_laptops(driver: Chrome) -> None:
     logger.info("Navigating to laptops PLP")
     driver.get("https://www.bestbuy.com/?intl=nosplash")
-    time.sleep(0.5)
+    time.sleep(0.8)
     try:
-        driver.add_cookie({"name": "intl_splash", "value": "false",
-                           "domain": ".bestbuy.com", "path": "/"})
-        driver.add_cookie({"name": "locDestZip", "value": "96939",
-                           "domain": ".bestbuy.com", "path": "/"})
-        driver.add_cookie({"name": "locStoreId", "value": "852",
-                           "domain": ".bestbuy.com", "path": "/"})
+        driver.add_cookie(
+            {"name": "intl_splash", "value": "false", "domain": ".bestbuy.com", "path": "/"}
+        )
+        driver.add_cookie(
+            {"name": "locDestZip", "value": "96939", "domain": ".bestbuy.com", "path": "/"}
+        )
+        driver.add_cookie(
+            {"name": "locStoreId", "value": "852", "domain": ".bestbuy.com", "path": "/"}
+        )
     except Exception:
         pass
 
@@ -308,262 +342,103 @@ def navigate_to_laptops(driver: Chrome) -> None:
     raise TimeoutException("Could not load BestBuy laptops PLP (blocked or template mismatch).")
 
 
-# ---------- MAIN RESULTS-ONLY harvesting ----------
-def _results_count_hint(driver: Chrome) -> int | None:
-    # e.g., "Showing 1-24 of 202 results"
+# =========================
+# Results container & tab switch
+# =========================
+def _switch_to_products_tab(driver: Chrome, timeout=12) -> None:
+    # If results already visible, skip
+    for sel in ['[data-testid="sku-list"]', 'ol.sku-item-list', '[data-widget="product-list"]', '#search-results-list']:
+        if driver.find_elements(By.CSS_SELECTOR, sel):
+            return
+
+    WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, '[role="tablist"]'))
+    )
+    tabs = driver.find_elements(By.CSS_SELECTOR, '[role="tab"]')
+    target = None
+    for t in tabs:
+        label = (t.text or t.get_attribute("aria-label") or "").strip().lower()
+        if "product" in label:  # “Products”
+            target = t
+            break
+    if target:
+        driver.execute_script("arguments[0].click();", target)
+    # Wait for a results container (the actual grid)
+    WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((
+            By.CSS_SELECTOR,
+            '[data-testid="sku-list"], ol.sku-item-list, [data-widget="product-list"], #search-results-list'
+        ))
+    )
+
+
+def _get_results_container(driver: Chrome):
+    # Preferred selectors for the results (not cross-sell)
     for sel in [
-        "[data-testid='results-summary']",
-        "[data-testid='search-results-count']",
-        ".results-summary",
-        "[data-testid='pagination-summary']",
+        '[data-testid="sku-list"]',
+        'ol.sku-item-list',
+        '[data-zone="searchResults"]',
+        '[data-widget="product-list"]',
+        '#search-results-list',
+        'main [data-component="search-results"]',
     ]:
-        try:
-            txt = (driver.find_element(By.CSS_SELECTOR, sel).text or "").strip()
-            m = re.search(r"of\s+(\d[\d,]*)\s+results?", txt, re.I)
-            if m:
-                return int(m.group(1).replace(",", ""))
-        except Exception:
-            pass
-    return None
+        els = driver.find_elements(By.CSS_SELECTOR, sel)
+        if els:
+            return els[0]
+    # Fallback: main
+    return driver.find_element(By.CSS_SELECTOR, 'main')
 
 
-def _pagination_buttons(driver: Chrome) -> list[str]:
-    """Return list of cp= page numbers visible in the pagination tabs."""
-    pages = []
-    for sel in [
-        "[data-testid='pagination']",
-        "nav[aria-label='Pagination']",
-        "ul.pagination",
-    ]:
-        try:
-            nav = driver.find_element(By.CSS_SELECTOR, sel)
-            btns = nav.find_elements(By.CSS_SELECTOR, "a, button")
-            for b in btns:
-                t = (b.text or "").strip()
-                if t.isdigit():
-                    pages.append(t)
-        except Exception:
-            continue
-    # Dedup, keep order
-    out = []
-    for p in pages:
-        if p not in out:
-            out.append(p)
-    return out
-
-
-def _find_main_results_containers(driver: Chrome) -> list:
-    """
-    Identify containers that hold the filtered list results (not carousels or cross-sell sections).
-    """
-    candidates = []
-
-    # Preferred modern container
-    for sel in [
-        "[data-testid='list-results']",
-        "ol.sku-item-list",
-        "div.results-list",
-        "[data-testid='sku-list']",
-    ]:
-        candidates += driver.find_elements(By.CSS_SELECTOR, sel)
-
-    # Filter out containers that belong to excluded sections by nearest heading
-    finals = []
-    for c in candidates:
-        try:
-            root = c
-            # Walk up a bit and search for a heading nearby (h2/h3/aria)
-            parent = c
-            heading_txt = ""
-            for _ in range(3):
-                parent = parent.find_element(By.XPATH, "./..")
-                try:
-                    h = parent.find_element(By.CSS_SELECTOR, "h2, h3, [aria-label]")
-                    heading_txt = (h.text or h.get_attribute("aria-label") or "").strip().lower()
-                    if heading_txt:
-                        break
-                except Exception:
-                    continue
-            if any(t in heading_txt for t in EXCLUDED_SECTION_TITLES):
-                continue
-            finals.append(root)
-        except Exception:
-            finals.append(c)
-
-    # De-duplicate by id
-    seen = set()
-    uniq = []
-    for c in finals:
-        ref = c.id if hasattr(c, "id") else id(c)
-        if ref not in seen:
-            uniq.append(c)
-            seen.add(ref)
-    return uniq
-
-
-def _find_plp_cards(driver: Chrome) -> list:
-    """
-    Find only cards inside the main filtered results container(s).
-    """
-    containers = _find_main_results_containers(driver)
-    cards = []
-    for cont in containers:
-        try:
-            cards += cont.find_elements(By.CSS_SELECTOR, "[data-testid='sku-item'], li.product-list-item.product-list-item-gridView")
-        except Exception:
-            continue
+def _find_product_cards(container) -> list:
+    # Keep this broad to handle multiple A/B variants
+    cards = container.find_elements(By.CSS_SELECTOR, """
+        li.sku-item,
+        [data-testid="sku-item"],
+        article[data-sku-id]
+    """)
     return cards
 
 
-def _extract_product_urls_from_results(driver: Chrome) -> set[str]:
-    """
-    Extract product URLs from cards within the main results container(s) only.
-    """
-    urls: set[str] = set()
-    for card in _find_plp_cards(driver):
-        try:
-            a = card.find_element(By.CSS_SELECTOR, "a[href]")
-            href = a.get_attribute("href") or ""
-            href = href.split("#")[0]
-            if "bestbuy.com" in href and PRODUCT_HREF_RE.search(href):
-                urls.add(href)
-        except Exception:
-            # try any child anchors
-            try:
-                anchors = card.find_elements(By.CSS_SELECTOR, "a[href]")
-                for a2 in anchors:
-                    href = (a2.get_attribute("href") or "").split("#")[0]
-                    if "bestbuy.com" in href and PRODUCT_HREF_RE.search(href):
-                        urls.add(href)
-                        break
-            except Exception:
-                continue
-    return urls
+def _card_to_url(card) -> Optional[str]:
+    # Prefer PDP anchors with skuId
+    for sel in ['a[href*="/site/"][href*="skuId="]', 'a[href*="/product/"]', 'a[href$=".p"]']:
+        a = card.find_elements(By.CSS_SELECTOR, sel)
+        if a:
+            href = (a[0].get_attribute("href") or "").split("#")[0]
+            if PRODUCT_HREF_RE.search(href):
+                return href
+    # Fallback: use data-sku-id to construct
+    sku = (card.get_attribute("data-sku-id") or "").strip()
+    if sku:
+        return f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
+    return None
 
 
-def _click_show_more_or_next(driver: Chrome) -> bool:
-    candidates = [
-        "button[data-testid='btn-load-more']",
-        "a[aria-label='Next'], button[aria-label='Next']",
-        "a[aria-label='Next Page'], button[aria-label='Next Page']",
-    ]
-    for sel in candidates:
+def _results_count_text(driver: Chrome) -> Optional[str]:
+    # Best-effort capture of "XXX items" badge
+    for sel in [
+        "[data-testid='result-count']",
+        "h1 ~ span",  # sometimes shows near heading
+        "[class*='result-count']",
+    ]:
         try:
-            btn = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            driver.execute_script("arguments[0].click();", btn)
-            _ = _wait_for_grid_refresh(driver, timeout=20)
-            return True
+            txt = (driver.find_element(By.CSS_SELECTOR, sel).text or "").strip()
+            if re.search(r"\d+\s+item", txt.lower()):
+                return txt
         except Exception:
             continue
-    return False
+    return None
 
 
-def _set_query_param(url: str, key: str, val: str | None) -> str:
-    parts = list(urlparse(url))
-    q = dict(parse_qsl(parts[4]))
-    if val is None:
-        q.pop(key, None)
-    else:
-        q[key] = str(val)
-    parts[4] = urlencode(q)
-    return urlunparse(parts)
-
-
-def list_products(driver: Chrome) -> list[dict]:
-    """
-    Harvest ONLY filtered products from the main results, across tabbed pages.
-    Returns items and logs page count + total count.
-    """
-    logger.info("Collecting filtered product links from results (excluding cross-sell)…")
-    _wait(driver, By.CSS_SELECTOR, "body")
-    clear_overlays(driver)
-    _dismiss_backdrops(driver)
-
-    base_url = driver.current_url
-    max_pages = max(1, getattr(SETTINGS, "max_pages", 25))
-    max_products = max(1, getattr(SETTINGS, "max_products", 800))
-
-    total_hint = _results_count_hint(driver)
-    page_tabs = _pagination_buttons(driver)
-    known_pages = sorted({int(p) for p in page_tabs}) if page_tabs else [1]
-
-    all_urls: set[str] = set()
-    visited_pages = 0
-
-    def harvest_current() -> set[str]:
-        # Scroll to ensure all items in this page load
-        smart_scroll(driver, passes=8, pause=0.25)
-        clear_overlays(driver)
-        _dismiss_backdrops(driver)
-        return _extract_product_urls_from_results(driver)
-
-    # If we detected page tabs, iterate them; else, try cp= fallback + Show more/Next
-    if known_pages and len(known_pages) > 1:
-        for cp in known_pages:
-            if visited_pages >= max_pages or len(all_urls) >= max_products:
-                break
-            page_url = _set_query_param(base_url, "cp", str(cp))
-            logger.info(f"Open tab page cp={cp}")
-            driver.get(page_url)
-            try:
-                _assert_laptop_plp_loaded(driver, timeout=20)
-            except TimeoutException:
-                logger.warning("PLP not ready on tab; skipping page.")
-                continue
-            new = harvest_current()
-            before = len(all_urls)
-            all_urls |= new
-            visited_pages += 1
-            logger.info(f"Tab {cp}: +{len(all_urls)-before} (total {len(all_urls)})")
-    else:
-        # cp= fallback
-        cp = 1
-        while cp <= max_pages and len(all_urls) < max_products:
-            page_url = _set_query_param(base_url, "cp", str(cp)) if cp > 1 else base_url
-            if cp > 1:
-                logger.info(f"Open page cp={cp}")
-                driver.get(page_url)
-                try:
-                    _assert_laptop_plp_loaded(driver, timeout=20)
-                except TimeoutException:
-                    logger.warning("PLP not ready via cp=; try Show more/Next.")
-                    break
-            before = len(all_urls)
-            all_urls |= harvest_current()
-            visited_pages += 1
-            logger.info(f"Page {cp}: +{len(all_urls)-before} (total {len(all_urls)})")
-
-            # If nothing new, try Show more/Next once.
-            if len(all_urls) == before:
-                if _click_show_more_or_next(driver):
-                    all_urls |= harvest_current()
-                    logger.info(f"After Show more/Next: total {len(all_urls)}")
-                else:
-                    break
-            if total_hint and len(all_urls) >= total_hint:
-                break
-            cp += 1
-
-    if len(all_urls) > max_products:
-        logger.info(f"Capping URLs at max_products={max_products}")
-        all_urls = set(list(all_urls)[:max_products])
-
-    logger.info(f"Detected pages (tabs): {len(known_pages) if page_tabs else visited_pages} | "
-                f"Collected items: {len(all_urls)}"
-                + (f" | Results hint: {total_hint}" if total_hint else ""))
-
-    items = [{"name": None, "price": None, "rating": None, "reviews": 0, "url": u} for u in sorted(all_urls)]
-    return items
-
-
-# ---------- Filters ----------
+# =========================
+# Filtering
+# =========================
 def _scroll_into_view(driver: Chrome, element) -> None:
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-    time.sleep(0.1)
+    time.sleep(0.15)
 
 
-def _click_checkbox_by(driver: Chrome, by, value, desc: str, wait_after=0.8) -> bool:
+def _click_checkbox_by(driver: Chrome, by, value, desc: str, wait_after=1.0) -> bool:
     try:
         el = WebDriverWait(driver, 8).until(EC.presence_of_element_located((by, value)))
         _scroll_into_view(driver, el)
@@ -597,43 +472,59 @@ def _set_price_range(driver: Chrome, min_price: int, max_price: int) -> None:
     container = WebDriverWait(driver, 15).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "section.facet[data-facet='currentprice_facet']"))
     )
-    min_inp = container.find_element(By.CSS_SELECTOR, "input[aria-label='Minimum price'], input[placeholder='Min Price']")
-    max_inp = container.find_element(By.CSS_SELECTOR, "input[aria-label='Maximum price'], input[placeholder='Max Price']")
+    min_inp = container.find_element(
+        By.CSS_SELECTOR, "input[aria-label='Minimum price'], input[placeholder='Min Price']"
+    )
+    max_inp = container.find_element(
+        By.CSS_SELECTOR, "input[aria-label='Maximum price'], input[placeholder='Max Price']"
+    )
     set_btn = container.find_element(By.CSS_SELECTOR, "button.current-price-facet-set-button")
 
-    _scroll_into_view(driver, min_inp)
+    try:
+        _scroll_into_view(driver, min_inp)
+    except Exception:
+        pass
 
     for el in (min_inp, max_inp):
-        try: el.clear()
-        except Exception: pass
+        try:
+            el.clear()
+        except Exception:
+            pass
 
-    try: driver.execute_script("arguments[0].focus();", min_inp)
-    except Exception: pass
+    # Focus via JS (avoid click interception)
+    try:
+        driver.execute_script("arguments[0].focus();", min_inp)
+    except Exception:
+        pass
     _react_set_input_value(driver, min_inp, str(min_price))
-    time.sleep(0.05)
+    time.sleep(0.1)
 
-    try: driver.execute_script("arguments[0].focus();", max_inp)
-    except Exception: pass
+    try:
+        driver.execute_script("arguments[0].focus();", max_inp)
+    except Exception:
+        pass
     _react_set_input_value(driver, max_inp, str(max_price))
-    time.sleep(0.05)
+    time.sleep(0.15)
 
+    # Wait for Set button to be enabled; nudge validation if needed
     end = time.time() + 6
     while time.time() < end:
         _dismiss_backdrops(driver)
-        disabled = set_btn.get_attribute("disabled")
-        busy = set_btn.get_attribute("aria-busy")
+        disabled_attr = set_btn.get_attribute("disabled")
+        aria_busy = set_btn.get_attribute("aria-busy")
         cls = set_btn.get_attribute("class") or ""
-        if not disabled and busy != "true" and "opacity-disabled" not in cls:
+        if not disabled_attr and aria_busy != "true" and "opacity-disabled" not in cls:
             break
         try:
             driver.execute_script(
                 "arguments[0].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));",
-                max_inp
+                max_inp,
             )
         except Exception:
             pass
-        time.sleep(0.15)
+        time.sleep(0.25)
 
+    # Prefer JS click
     try:
         _dismiss_backdrops(driver)
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", set_btn)
@@ -642,12 +533,14 @@ def _set_price_range(driver: Chrome, min_price: int, max_price: int) -> None:
         try:
             driver.execute_script(
                 "arguments[0].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));",
-                max_inp
+                max_inp,
             )
         except Exception:
             pass
 
-    _ = _wait_for_grid_refresh(driver, timeout=25)
+    count_after = _wait_for_grid_refresh(driver, timeout=25)
+    if count_after <= 0:
+        logger.warning("Price inputs submitted but no products visible yet; continuing.")
     logger.info(f"Applied filter: Price range ${min_price}–${max_price} via inputs")
 
 
@@ -669,32 +562,31 @@ def apply_filters(driver: Chrome) -> None:
         f"//input[@id='customer-rating-{int(SETTINGS.min_rating)}_&_Up' "
         f"or @aria-label='{rating_label}' or @aria-label='{int(SETTINGS.min_rating)} stars & Up']",
         f"Rating: {rating_label}",
-        wait_after=0.8,
+        wait_after=1.0,
     )
     _wait_for_grid_refresh(driver)
     _dismiss_backdrops(driver)
 
-    # Brand facet expand
+    # Expand brands if available
     try:
         show_all = driver.find_element(
             By.CSS_SELECTOR,
-            "section.facet[data-facet='brand_facet'] button.show-more-link, [data-show-more='brand_facet']"
+            "section.facet[data-facet='brand_facet'] button.show-more-link, [data-show-more='brand_facet']",
         )
         _scroll_into_view(driver, show_all)
         _dismiss_backdrops(driver)
         driver.execute_script("arguments[0].click();", show_all)
-        time.sleep(0.3)
+        time.sleep(0.5)
     except Exception:
         pass
 
-    # Brands
     for b in SETTINGS.top_brands:
         ok = _click_checkbox_by(
             driver,
             By.XPATH,
             f"//section[@data-facet='brand_facet']//input[@id={repr(b)}]",
             f"Brand: {b}",
-            wait_after=0.6,
+            wait_after=0.8,
         )
         if not ok:
             _click_checkbox_by(
@@ -702,16 +594,107 @@ def apply_filters(driver: Chrome) -> None:
                 By.XPATH,
                 f"//section[@data-facet='brand_facet']//label[contains(., {repr(b)})]//input[@type='checkbox']",
                 f"Brand: {b}",
-                wait_after=0.6,
+                wait_after=0.8,
             )
         _wait_for_grid_refresh(driver)
         _dismiss_backdrops(driver)
 
-    # Price
+    # Price via inputs
     _set_price_range(driver, SETTINGS.price_min, SETTINGS.price_max)
 
+    # Switch to the “Products” tab before collecting results
+    _switch_to_products_tab(driver, timeout=12)
+    # Log result count if visible
+    rc = _results_count_text(driver)
+    if rc:
+        logger.info(f"Results badge: {rc}")
 
-# ---------- PDP scraping ----------
+
+# =========================
+# Pagination utilities
+# =========================
+def _set_page(url: str, page: int) -> str:
+    parts = list(urlparse(url))
+    q = dict(parse_qsl(parts[4]))
+    q["cp"] = str(page)
+    parts[4] = urlencode(q)
+    return urlunparse(parts)
+
+
+def _iterate_pages(driver: Chrome, start_url: str, max_pages: int = 20):
+    """
+    Yield (page_number, cards_list) across paginated result pages.
+    Uses &cp= param; falls back to visible "Next" if present.
+    """
+    page = 1
+    while page <= max_pages:
+        if page > 1:
+            driver.get(_set_page(start_url, page))
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+            _switch_to_products_tab(driver, timeout=10)
+
+        container = _get_results_container(driver)
+        cards = _find_product_cards(container)
+        yield page, cards
+
+        # Detect “Next”
+        next_btns = driver.find_elements(
+            By.CSS_SELECTOR,
+            'nav[aria-label="Pagination"] a[aria-label*="Next"], '
+            'nav[aria-label="Pagination"] button[aria-label*="Next"]'
+        )
+        if not next_btns:
+            break
+        cls = (next_btns[0].get_attribute("class") or "").lower()
+        disabled = "disabled" in cls or next_btns[0].get_attribute("aria-disabled") == "true"
+        if disabled:
+            break
+        page += 1
+
+
+# =========================
+# Listing & PDP enrichment
+# =========================
+def list_products(driver: Chrome) -> list[dict]:
+    """
+    Collect only filtered product links from the Products tab across all pages.
+    Excludes cross-sell blocks.
+    """
+    logger.info("Collecting filtered product links from results (excluding cross-sell)…")
+    _switch_to_products_tab(driver, timeout=12)
+
+    collected: list[str] = []
+    seen: set[str] = set()
+    start_url = driver.current_url
+    total_pages = 0
+
+    max_pages = int(getattr(SETTINGS, "max_pages", 20))
+
+    for page, cards in _iterate_pages(driver, start_url, max_pages=max_pages):
+        urls_this_page: list[str] = []
+        for c in cards:
+            u = _card_to_url(c)
+            if not u:
+                continue
+            if PRODUCT_HREF_RE.search(u):
+                urls_this_page.append(u)
+
+        # de-dup while preserving order
+        added = 0
+        for u in urls_this_page:
+            if u not in seen:
+                seen.add(u)
+                collected.append(u)
+                added += 1
+
+        logger.info(f"Page {page}: +{added} (total {len(collected)})")
+        total_pages = page
+
+    logger.info(f"Detected pages (tabs): {total_pages} | Collected items: {len(collected)}")
+
+    return [{"name": None, "price": None, "rating": None, "reviews": 0, "url": u} for u in collected]
+
+
 def _extract_name_price_rating_on_pdp(driver: Chrome) -> tuple[str | None, float | None, float | None]:
     # Name
     name = None
@@ -731,7 +714,7 @@ def _extract_name_price_rating_on_pdp(driver: Chrome) -> tuple[str | None, float
         "[data-testid='price-block'] [data-testid*='customer'] span",
         "[data-lu-target='customer_price'] span",
         "[data-lu-target='customer_price']",
-        ".priceView-hero-price span",
+        "[data-testid='customer-price'] span"
     ]:
         try:
             price_text = safe_get_text(driver.find_element(By.CSS_SELECTOR, sel))
@@ -741,7 +724,7 @@ def _extract_name_price_rating_on_pdp(driver: Chrome) -> tuple[str | None, float
             pass
     price = parse_price(price_text or "")
 
-    # Rating (best-effort)
+    # Rating
     rating = None
     for sel in ["[data-testid='rating-stars']", "[aria-label*='rating']", "[data-lu-target='rating']"]:
         try:
@@ -756,94 +739,57 @@ def _extract_name_price_rating_on_pdp(driver: Chrome) -> tuple[str | None, float
     return name, price, rating
 
 
-def _is_laptop_category(driver: Chrome) -> bool:
+@rate_limited(SETTINGS.rate_limit_min_s, SETTINGS.rate_limit_max_s)
+def fetch_product_detail(url: str, attempt: int = 1) -> dict:
     """
-    Validate PDP belongs to laptops using breadcrumb/category cues and title.
+    Navigate a single PDP and collect specs, price, rating.
+    Retries once on page timeouts/renderer hiccups.
     """
-    checks = [
-        "[data-testid='breadcrumb']",
-        "nav.breadcrumb",
-        "ol[aria-label='breadcrumb']",
-        ".shop-breadcrumb",
-    ]
-    for sel in checks:
-        try:
-            txt = (driver.find_element(By.CSS_SELECTOR, sel).text or "").lower()
-            if any(kw in txt for kw in ("laptop", "macbook", "notebook", "computers")):
-                return True
-        except Exception:
-            continue
-    try:
-        title = (driver.title or "").lower()
-        if any(kw in title for kw in LAPTOP_KEYWORDS):
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _stable_get(driver: Chrome, url: str, timeout: int) -> None:
-    try:
-        driver.set_page_load_timeout(timeout)
-        driver.get(url)
-    except TimeoutException:
-        try:
-            WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
-            logger.debug("Continuing after load timeout: DOM is present.")
-        except Exception as e:
-            raise e
-
-
-@rate_limited(getattr(SETTINGS, "rate_limit_min_s", 0.0), getattr(SETTINGS, "rate_limit_max_s", 0.0))
-def fetch_product_detail(url: str, attempt: int = 1, max_attempts: int = 2) -> dict:
     driver: Chrome | None = None
     try:
         driver = _build_driver()
-        _stable_get(driver, url, timeout=getattr(SETTINGS, "page_load_timeout", 60))
+        # Make PDP loads a bit stricter
+        driver.set_page_load_timeout(min(getattr(SETTINGS, "page_load_timeout", 60), 45))
+        driver.get(url)
         _wait(driver, By.CSS_SELECTOR, "body", timeout=15)
         clear_overlays(driver)
         _dismiss_backdrops(driver)
 
-        if not _is_laptop_category(driver):
-            logger.warning(f"Non-laptop PDP (skipped): {url}")
-            return {"skip": True, "url": url, "name": None, "price": None, "rating": None, "specs": {}, "reviews": []}
-
         name, price, rating = _extract_name_price_rating_on_pdp(driver)
 
         specs: dict[str, Any] = {}
-        for row in driver.find_elements(By.CSS_SELECTOR, ".specification-row, .specs tr, [data-testid*='spec'] tr"):
+        for row in driver.find_elements(
+            By.CSS_SELECTOR,
+            ".specification-row, .specs tr, [data-testid*='spec'] tr, "
+            "[data-component='specifications'] tr"
+        ):
             try:
-                k = safe_get_text(row.find_element(By.CSS_SELECTOR, ".row-title, th, [data-testid='spec-key']"))
-                v = safe_get_text(row.find_element(By.CSS_SELECTOR, ".row-value, td, [data-testid='spec-value']"))
+                k = safe_get_text(
+                    row.find_element(By.CSS_SELECTOR, ".row-title, th, [data-testid='spec-key']")
+                )
+                v = safe_get_text(
+                    row.find_element(By.CSS_SELECTOR, ".row-value, td, [data-testid='spec-value']")
+                )
                 if k:
                     specs[k] = v
             except Exception:
                 continue
 
-        # Reviews: optional, best-effort
+        # BestBuy reviews are often lazy/iframes; skip heavy review crawling for speed
         reviews: list[dict[str, Any]] = []
-        for r in driver.find_elements(By.CSS_SELECTOR, ".review, .ugc-review, [data-testid*='review']"):
+
+        return {"name": name, "price": price, "rating": rating, "specs": specs, "reviews": reviews}
+
+    except (TimeoutException, WebDriverException) as e:
+        if attempt == 1:
+            logger.warning(f"PDP timeout, retrying once: {url}")
             try:
-                txt = safe_get_text(
-                    r.find_element(By.CSS_SELECTOR, ".pre-white-space, .review-text, [data-testid='review-text']")
-                )
-                score_txt = safe_get_text(
-                    r.find_element(By.CSS_SELECTOR, ".c-review-average, .rating, [data-testid='rating']")
-                )
-                m = re.search(r"(\d+(\.\d+)?)", score_txt or "")
-                score = float(m.group(1)) if m else None
-                reviews.append({"text": txt, "score": score})
+                driver.quit()
             except Exception:
-                continue
-
-        return {"skip": False, "url": url, "name": name, "price": price, "rating": rating, "specs": specs, "reviews": reviews}
-
-    except WebDriverException as e:
+                pass
+            return fetch_product_detail(url, attempt=2)
         logger.error(f"Selenium error on {url}: {e}")
-        if attempt < max_attempts:
-            time.sleep(0.5 + random.random())
-            return fetch_product_detail(url, attempt=attempt + 1, max_attempts=max_attempts)
-        return {"skip": True, "url": url, "name": None, "price": None, "rating": None, "specs": {}, "reviews": []}
+        return {"name": None, "price": None, "rating": None, "specs": {}, "reviews": []}
     finally:
         if driver:
             try:
@@ -852,79 +798,53 @@ def fetch_product_detail(url: str, attempt: int = 1, max_attempts: int = 2) -> d
                 pass
 
 
-# ---------- Enrichment ----------
 def enrich_products(products: list[dict]) -> list[dict]:
     """
     Enrich product seeds with PDP details.
-    Multithreaded with tqdm; guarded by a semaphore to avoid Chrome overload.
+    Shows a tqdm progress bar for both single-threaded and multithreaded modes.
     """
     if not products:
         return []
 
     total = len(products)
-    max_workers = max(1, getattr(SETTINGS, "threads", 6))
-    enable_mt = bool(getattr(SETTINGS, "enable_multithreading", True))
-    max_parallel = max(1, getattr(SETTINGS, "max_parallel_browsers", min(6, max_workers)))
-
-    if enable_mt and max_workers > 1:
-        from threading import Semaphore
-        gate = Semaphore(max_parallel)
-
-        def guarded_fetch(u: str) -> dict:
-            with gate:
-                return fetch_product_detail(u)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as ex, \
-             tqdm(total=total, desc="Fetching details", unit="item", dynamic_ncols=True) as pbar:
-
-            fut_to_idx = {ex.submit(guarded_fetch, p["url"]): i for i, p in enumerate(products)}
-            for fut in as_completed(fut_to_idx):
-                idx = fut_to_idx[fut]
+    if SETTINGS.enable_multithreading and total > 1:
+        with ThreadPoolExecutor(max_workers=SETTINGS.threads) as ex, tqdm(
+            total=total, desc="Fetching details", unit="item", dynamic_ncols=True
+        ) as pbar:
+            future_to_idx = {
+                ex.submit(fetch_product_detail, p["url"]): i for i, p in enumerate(products)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
                 try:
-                    detail = fut.result()
-                    if detail.get("skip"):
-                        products[idx]["skip"] = True
-                    else:
-                        for k, v in detail.items():
-                            if k != "skip":
-                                products[idx][k] = v
-                        products[idx]["reviews"] = len(products[idx].get("reviews") or [])
+                    detail = future.result()
+                    for k, v in detail.items():
+                        products[idx][k] = v
+                    products[idx]["reviews"] = len(products[idx].get("reviews") or [])
                 except Exception as e:
                     logger.error(f"Failed to enrich product {products[idx].get('url')}: {e}")
-                    products[idx]["skip"] = True
                 finally:
                     pbar.update(1)
+        return products
     else:
         with tqdm(total=total, desc="Fetching details", unit="item", dynamic_ncols=True) as pbar:
-            for p in products:
+            for i, p in enumerate(products):
                 try:
                     detail = fetch_product_detail(p["url"])
-                    if detail.get("skip"):
-                        p["skip"] = True
-                    else:
-                        for k, v in detail.items():
-                            if k != "skip":
-                                p[k] = v
-                        p["reviews"] = len(p.get("reviews") or [])
+                    for k, v in detail.items():
+                        p[k] = v
+                    p["reviews"] = len(p.get("reviews") or [])
                 except Exception as e:
                     logger.error(f"Failed to enrich product {p.get('url')}: {e}")
-                    p["skip"] = True
                 finally:
                     pbar.update(1)
-
-    kept = [p for p in products if not p.get("skip")]
-    dropped = len(products) - len(kept)
-    if dropped:
-        logger.info(f"Filtered out {dropped} non-laptop/failed PDPs.")
-    return kept
+        return products
 
 
-# ---------- Entry ----------
+# =========================
+# Entry point
+# =========================
 def run_scrape(output_json: Path | None = None) -> list[dict]:
-    """
-    Orchestrates: navigate → apply filters → collect only filtered results across tabbed pages
-    → PDP enrich → save JSON, and logs page & item counts.
-    """
     output_json = output_json or SETTINGS.raw_json_path
     driver = _build_driver()
     try:
